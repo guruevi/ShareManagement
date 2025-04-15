@@ -1,0 +1,6 @@
+{
+    "server": "ldap://your-ad-server",
+    "user": "your-ad-username",
+    "password": "your-ad-password",
+    "search_base": "dc=example,dc=com"
+}

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ 'Edit Share' if edit_mode else 'Create Share' }}</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.0/dist/darkly/bootstrap.min.css">
+    <style>
+        .form-control::placeholder {
+            color: lightgray;
+            opacity: 1; /* Ensures the placeholder is fully visible */
+        }
+    </style>
+    <script>
+        let abortController = null;
+        let debounceTimeout = null;
+        let config = {{ config | tojson }};
+
+        async function lookupUser(inputId, resultId, formElementId, multiple = false) {
+            const inputElement = document.getElementById(inputId);
+            const query = inputElement.value;
+            const resultList = document.getElementById(resultId);
+            const formElement = document.getElementById(formElementId);
+
+            if (!query || query.length < 3) {
+                resultList.style.display = 'none';
+                return;
+            }
+
+            // Clear the previous debounce timeout
+            clearTimeout(debounceTimeout);
+
+            // Set a new debounce timeout
+            debounceTimeout = setTimeout(async () => {
+                // Cancel the previous request if it exists
+                if (abortController) {
+                    abortController.abort();
+                }
+
+                // Create a new AbortController for the current request
+                abortController = new AbortController();
+                const signal = abortController.signal;
+
+                try {
+                    const response = await fetch(`/lookup_user?query=${encodeURIComponent(query)}`, { signal });
+                    const results = await response.json();
+
+                    resultList.innerHTML = ''; // Clear previous results
+                    if (results.length > 0) {
+                        results.forEach(user => {
+                            const item = document.createElement('li');
+                            item.className = 'dropdown-item';
+                            item.textContent = `${user.first_name} ${user.last_name} (${user.email})`;
+                            item.onclick = () => {
+                                if (multiple) {
+                                    const currentValues = formElement.value ? formElement.value.split(',') : [];
+                                    if (!currentValues.includes(user.samAccountName)) {
+                                        currentValues.push(user.samAccountName);
+                                    }
+                                    formElement.value = currentValues.join(',');
+                                    inputElement.value = '';
+                                } else {
+                                    formElement.value = user.samAccountName;
+                                    inputElement.value = `${user.samAccountName} (${user.last_name}, ${user.first_name})`;
+                                }
+                                resultList.style.display = 'none';
+                            };
+                            resultList.appendChild(item);
+                        });
+                        resultList.style.display = 'block';
+                    } else {
+                        resultList.style.display = 'none';
+                    }
+                } catch (error) {
+                    if (error.name !== 'AbortError') {
+                        console.error('Error fetching user data:', error);
+                    }
+                }
+            }, 250); // Delay of 250ms
+        }
+        {% if edit_mode %}
+        document.addEventListener('DOMContentLoaded', () => {
+            // Set lookup field value to the field value
+            document.getElementById('ownerLookup').value = document.getElementById('owner').value;
+        });
+        {% else %}
+        function updateFormFields() {
+            const customer = document.getElementById('customer').value;
+            const customerConfig = config[customer] || {};
+
+            // Reset all fields with data-override attribute
+            const allFields = document.querySelectorAll('[data-override]');
+            allFields.forEach(field => {
+                field.removeAttribute('disabled');
+                field.removeAttribute('data-override');
+                field.removeAttribute('hidden')
+                field.value = '';
+                field.querySelectorAll('option').forEach(option => {
+                    option.selected = false;
+                });
+            });
+            for (const [field, settings] of Object.entries(customerConfig)) {
+                const input = document.getElementById(field);
+                // Set the parent to the ID of the customer
+                if (field === 'parent') {
+                    settings['value'] = customerConfig['id']
+                }
+                console.debug('Field:', field, 'Settings:', settings);
+                if (input) {
+                    if (input.multiple && settings['value']) {
+                        // Split the protocol string into an array
+                        const options = Array.from(input.querySelectorAll('option'));
+                        settings['value'].split(',').forEach(value => {
+                            options.find(c => c.value === value).selected = true;
+                        });
+                    } else {
+                       input.value = settings['value'];
+                    }
+                    input.disabled = settings['disabled'] || false;
+                    input.hidden = settings['hidden'] || false;
+                    // Set a label so we can re-enable the control
+                    input.setAttribute('data-override', 'yes');
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            updateFormFields();
+        })
+
+        function selectCustomer(customerId) {
+            document.getElementById('customer').value = customerId;
+            updateFormFields();
+            const buttons = document.querySelectorAll('#customerButtons button');
+            buttons.forEach(button => button.classList.remove('active'));
+            const selectedButton = Array.from(buttons).find(button => button.getAttribute('onclick').includes(customerId));
+            if (selectedButton) {
+                selectedButton.classList.add('active');
+            }
+        }
+        {% endif %}
+        document.addEventListener('DOMContentLoaded', () => {
+            const form = document.querySelector('form');
+
+            form.addEventListener('submit', () => {
+                const disabledSelects = document.querySelectorAll('select[disabled]');
+                disabledSelects.forEach(select => {
+                    select.disabled = false; // Re-enable the select elements
+                });
+            });
+            const errors = {{ form.errors | tojson }};
+
+            for (const [field, messages] of Object.entries(errors)) {
+                const inputElement = document.getElementById(field);
+                if (inputElement) {
+                    const errorDiv = document.createElement('div');
+                    errorDiv.className = 'text-danger'; // Bootstrap class for error styling
+                    errorDiv.textContent = messages[0]; // Display the first error message
+                    inputElement.parentElement.appendChild(errorDiv);
+                }
+            }
+        });
+    </script>
+</head>
+<body class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h1>{{ 'Edit Share' if edit_mode else 'Create Share' }}</h1>
+        <a href="{{ url_for('shares') }}" class="btn btn-secondary">Back to Shares</a>
+    </div>
+    <form method="POST" class="needs-validation" novalidate>
+        {{ form.hidden_tag() }}
+        <div class="mb-3">
+            {{ form.customer.label(class="form-label") }}
+            {% if not edit_mode %}
+                <div id="customerButtons" class="d-flex flex-wrap gap-2">
+                    {% for key, value in form.customer.choices %}
+                        {% if key %}
+                            <button type="button" class="btn btn-outline-primary" onclick="selectCustomer('{{ key }}')">{{ value }}</button>
+                        {% endif %}
+                    {% endfor %}
+                </div>
+            {% endif %}
+            {{ form.customer(class="form-control", id="customer", disabled="true") }}
+        </div>
+        <div class="mb-3">
+            {{ form.folder_name.label(class="form-label") }}
+            {{ form.folder_name(class="form-control", id="folder_name", autocomplete="off", disabled=edit_mode) }}
+            {% if 'folder_name' in form.errors %}
+                <div class="invalid-feedback">
+                    {{ form.errors | tojson }}
+                </div>
+            {% endif %}
+
+        </div>
+        <div class="mb-3">
+            {{ form.quota.label(class="form-label") }}
+            {{ form.quota(class="form-control", id="quota", autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            {{ form.server.label(class="form-label") }}
+            {{ form.server(class="form-control", id="server", disabled=edit_mode, autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            {{ form.protocol.label(class="form-label") }}
+            {{ form.protocol(class="form-select", id="protocol", autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            <label for="ownerLookup">Lookup owner:</label>
+            <input type="text" id="ownerLookup" class="form-control" placeholder="Search owner..." oninput="lookupUser('ownerLookup', 'ownerResults', 'owner', false)" autocomplete="off">
+            <ul id="ownerResults" class="dropdown-menu w-100" style="display: none; position: absolute; z-index: 1000;"></ul>
+            {{ form.owner.label(class="form-label") }}
+            {{ form.owner(class="form-control d-none", id="owner", autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            <label for="usersLookup">Lookup users:</label>
+            <input type="text" id="usersLookup" class="form-control" placeholder="Search users..." oninput="lookupUser('usersLookup', 'usersResults', 'users', true)" autocomplete="off">
+            <ul id="usersResults" class="dropdown-menu w-100" style="display: none; position: absolute; z-index: 1000;"></ul>
+            {{ form.users.label(class="form-label") }}
+            {{ form.users(class="form-control", id="users", autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            {{ form.permission.label(class="form-label") }}
+            {{ form.permission(class="form-select", id="permission", autocomplete="off") }}
+        </div>
+        <div class="mb-3">
+            {{ form.parent.label(class="form-label") }}
+            {{ form.parent(class="form-select", id="parent", disabled=edit_mode, autocomplete="off") }}
+        </div>
+        <button type="submit" class="btn btn-primary">{{ form.submit.label.text }}</button>
+    </form>
+
+</body>
+</html>

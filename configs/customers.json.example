@@ -1,0 +1,20 @@
+{
+    "Generic": {
+        "server": {"value": "smdnas02", "disabled": true},
+        "parent": {"value": "/ifs/admin", "disabled": true},
+        "folder_name": {"value": "", "disabled": false},
+        "quota": {"value": 2, "disabled": false}
+    },
+    "URMC-CCMC": {
+        "folder_name": {"value": "DefaultFolderA", "disabled": true},
+        "quota": {"value": 10, "disabled": true}
+    },
+    "GRC": {
+        "server": {"value": "ServerB", "disabled": true},
+        "protocol": {"value": "NFS", "disabled": true}
+    },
+    "FCC": {
+        "server": {"value": "ServerC", "disabled": true},
+        "protocol": {"value": "SMB", "disabled": true}
+    }
+}
