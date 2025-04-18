@@ -1,23 +1,19 @@
 import logging
-import re
 import time
 import uuid
+from copy import deepcopy, copy
 from threading import Thread
 from urllib.parse import unquote
 
-import paramiko
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from flask_wtf import FlaskForm
-from wtforms import StringField, SelectField, IntegerField, SubmitField
-from wtforms.fields.choices import SelectMultipleField
-from wtforms.validators import DataRequired, NumberRange
 import json
 
-from helpers.parsers import parse_acl_output
+from helpers.commands import exec_command
 from helpers.domain import lookup_user, lookup_group_members
 from models.share import Share
 from models.base import Base
+from models.shareform import ShareForm
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'
@@ -25,21 +21,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'  # Replace with your 
 db = SQLAlchemy(app)
 
 # Form
-class ShareForm(FlaskForm):
-    customer = SelectField('Customer', choices=[], validators=[DataRequired()])
-    folder_name = StringField('Folder Name', validators=[DataRequired()])
-    quota = IntegerField('Quota (TB)',
-                         validators=[NumberRange(min=0, message="Quota must be a positive number or 0 to unset")])
-    server = SelectField('Server', choices=[], validators=[DataRequired()])
-    protocol = SelectMultipleField('Protocol',
-                                   choices=[('nfs', 'NFS'), ('smb', 'SMB'), ('s3', 'S3'), ('', 'Subfolder')])
-    owner = StringField('Owner', validators=[DataRequired()])
-    users = StringField('Users', validators=[DataRequired()])
-    permission = SelectField('Permission',
-                             choices=[('r,w,x', 'Read and Write'), ('r,x', 'Read Only')])
-    parent = SelectField('Parent Share', choices=[('', 'None')])  # New field
 
-    submit = SubmitField('Submit')
 
 # Load JSON Config
 with open('configs/customers.json') as f:
@@ -48,6 +30,8 @@ with open('configs/customers.json') as f:
     customerConfig = {'Generic': customerConfig_json.pop('Generic')} if 'Generic' in customerConfig_json else {
         'parent': {'value': ''}, 'quota': {'value': 0}}
     customerConfig.update({k: customerConfig_json[k] for k in sorted(customerConfig_json)})
+
+logging.basicConfig(level=logging.DEBUG)
 
 with app.app_context():
     # Bind the Base to the SQLAlchemy instance
@@ -70,7 +54,7 @@ with app.app_context():
                                protocol=customer_share.get('protocol', {}).get('value', 'nfs,smb'),
                                owner=customer_share.get('owner', {}).get('value', ''),
                                users=str(customer_share.get('owner', {}).get('value', '')),
-                               permission=customer_share.get('permission', {}).get('value', 'r,w,x'),
+                               permission=customer_share.get('permission', {}).get('value', 'rwx'),
                                # Never let desktop fix the permissions on underlying shares
                                can_fix=False
                                )
@@ -119,6 +103,7 @@ def manage_share(share_id=None):
             else:
                 form[field].data = props.get('value', '')
 
+        app.logger.debug(form.data)
         if not form.validate_on_submit():
             return render_template('create.html', form=form, edit_mode=edit_mode, config=customerConfig)
 
@@ -135,8 +120,22 @@ def manage_share(share_id=None):
         share.protocol = form.protocol.data
         share.quota = int(form.quota.data)
 
+        share.index = int(form.index.data)
+
         for field in ['owner', 'users', 'permission']:
             setattr(share, field, getattr(form, field).data)
+
+        # Map ACL permissions to the template
+        mapped_permission = serverConfig[share.server]['mapped_permission'][share.permission]
+        share_dict = deepcopy(share.__dict__)
+        share_dict.update({"mapped_permission": mapped_permission})
+
+        if edit_mode:
+            # Call Edit ACL
+            exec_command(serverConfig[share.server], "edit_acl", share_dict)
+        else:
+            # Call Create ACL
+            exec_command(serverConfig[share.server], "create_acl", share_dict)
 
         db.session.add(share)
         db.session.commit()
@@ -183,8 +182,18 @@ def lookup_user_route():
 @app.route('/delete/<int:share_id>', methods=['POST'])
 def delete_share(share_id):
     share = Share.query.get_or_404(share_id)
+
+    # We cannot delete POSIX permissions:
+    if share.index < 0:
+        return jsonify({"message": "Cannot delete POSIX permissions"}), 400
+
+    # Delete from SQL but do not commit - we do this here in case the SSH fails
+    # we commit after the SSH command succeeds
     db.session.delete(share)
+    exec_command(serverConfig[share.server], "delete_acl", share.__dict__)
     db.session.commit()
+    # Re-import the ACL from the server, because order may have changed
+    import_acl_from_server(share.server, share.folder_name)
     return jsonify({"message": "Share deleted successfully"}), 200
 
 
@@ -242,89 +251,30 @@ def import_share():
 
     return import_acl_from_server(server, folder)
 
-def exec_command(server, command_type, ssh, remote_folder):
-    """
-    Executes a command on the server via SSH and returns the output.
-    """
-    command = serverConfig[server][f"{command_type}_command"].format(path=remote_folder)
-    app.logger.debug(f"Executing command: {command}")
-    try:
-        # Execute the command
-        stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
-        if exit_status != 0:
-            raise OSError(f"{command_type} command failed with exit status {exit_status}: {stderr.read().decode('utf-8')}")
-        output = stdout.read().decode('utf-8').strip()
-        app.logger.debug(f"Output: {output}")
-        return output
-    except paramiko.SSHException as e:
-        raise
 
 def import_acl_from_server(server, remote_folder):
     """
     Connects to a server via SSH, gets the ACL from the folder and adds the entry to the database.
     """
     parent_folder = "/".join(remote_folder.split('/')[:-1])
-    parent = Share.query.filter_by(folder_name=parent_folder).first()
+    parent = Share.query.filter_by(folder_name=parent_folder, server=server).first()
     if not parent:
         return jsonify({"message": "Parent folder not found"}), 404
-    try:
-        server_ip = serverConfig[server]['host']
-        username = serverConfig[server]['username']
-        password = serverConfig[server]['password']
-        quota_regexp = serverConfig[server]['quota_regexp']
-        acl_parser = serverConfig[server]['acl_parser']
-        protocol_regexp = serverConfig[server]['protocol_regexp']
-    except KeyError:
-        return jsonify({"message": "Server not found in configuration"}), 404
 
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(server_ip, username=username, password=password)
-
-        acl_output = exec_command(server, "acl", ssh, remote_folder)
-        quota_output = exec_command(server, "quota", ssh, remote_folder)
-        protocol_output = exec_command(server, "protocol", ssh, remote_folder)
-    except paramiko.SSHException as e:
-        app.logger.error(e)
-        return jsonify({"message": "SSH Connection Issues"}), 500
-    except OSError as e:
-        app.logger.error(e)
-        return jsonify({"message": "Failed to get ACL"}), 500
-
-    # Get the quota from the output
-    quota_number = 0
-    quota_match = re.search(quota_regexp, quota_output)
-    if quota_match:
-        quota_group = quota_match.group('quota')
-        quota_unit = quota_match.group('unit')
-        if quota_unit == 'P':
-            quota_number = float(quota_group) * 1024 * 1024
-        elif quota_unit == 'T':
-            quota_number = float(quota_group) * 1024
-        elif quota_unit == 'G':
-            quota_number = float(quota_group)
-        elif quota_unit == 'M':
-            quota_number = float(quota_group) / 1024
-        elif quota_unit == 'K':
-            quota_number = float(quota_group) / 1024 / 1024
-        else:
-            # Presume bytes
-            quota_number = float(quota_group) / 1024 / 1024 / 1024
-
-    protocols = set()
-    for protocol in re.findall(protocol_regexp, protocol_output):
-        protocols.add(protocol)
-
-    parsed_acl = parse_acl_output(acl_output, acl_parser)
+    acl_output = exec_command(serverConfig[server], "acl", {"folder_name": remote_folder})
+    quota_output = exec_command(serverConfig[server], "quota", {"folder_name": remote_folder})
+    protocol_output = exec_command(serverConfig[server], "protocol", {"folder_name": remote_folder})
 
     owner_str = ""
-    owner = lookup_user(parsed_acl['owner'], search_by=[serverConfig[server]["acl_ldap_attribute"]], exact=True)
+    owner = lookup_user(acl_output['owner'], search_by=[serverConfig[server]["acl_ldap_attribute"]], exact=True)
     if owner:
         owner_str = owner[0][serverConfig[server]["acl_ldap_attribute"]]
 
-    for acl in parsed_acl['permissions']:
+    # Get the keys for each protocol that is not 0
+    protocols = {key for key, value in protocol_output.items() if value != 0}
+    quota = quota_output['hard']
+
+    for acl in acl_output['permissions']:
         if acl['access'] == "deny":
             # Skip denied permissions
             continue
@@ -342,7 +292,7 @@ def import_acl_from_server(server, remote_folder):
             users = lookup_group_members(acl['name'], serverConfig[server]["acl_ldap_attribute"])
         else:
             # This is an 'everyone' or unknown type, we presume the worst
-            users = {parsed_acl['everyone']}
+            users = {acl_output['everyone']}
 
         users.discard('')
         users.discard(None)
@@ -357,7 +307,7 @@ def import_acl_from_server(server, remote_folder):
         # Update the ACL
         share.customer = parent.customer
         share.folder_name = remote_folder
-        share.quota = quota_number
+        share.quota = quota
         share.index = acl['index']
         share.server = server
         share.protocol = protocols
@@ -370,9 +320,6 @@ def import_acl_from_server(server, remote_folder):
 
     # Commit changes to the database
     db.session.commit()
-
-    # Close connections
-    ssh.close()
 
     return jsonify({"message": "Import completed successfully"}), 200
 

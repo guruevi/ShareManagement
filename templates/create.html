@@ -219,6 +219,10 @@
             {{ form.users(class="form-control", id="users", autocomplete="off") }}
         </div>
         <div class="mb-3">
+            {{ form.index.label(class="form-label") }}
+            {{ form.index(class="form-control", id="index", autocomplete="off", disabled=(form.index.data | int) < 0) }}
+        </div>
+        <div class="mb-3">
             {{ form.permission.label(class="form-label") }}
             {{ form.permission(class="form-select", id="permission", autocomplete="off") }}
         </div>
